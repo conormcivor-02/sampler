@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Sampler Prototype</title>
+</head>
+<body>
+<h2>Pitch Sampler</h2>
+
+<input type="file" id="fileInput" accept="audio/*"><br><br>
+
+<label>Root Note (MIDI): <input type="number" id="rootNote" value="60" min="0" max="127"> (60 = C4)</label><br><br>
+<label>Volume: <input type="range" id="volume" min="0" max="2" step="0.01" value="1"></label><br><br>
+<label>Loop: <input type="checkbox" id="loop"></label><br><br>
+
+<p id="status">Load a sample to begin.</p>
+<p id="midiStatus">MIDI: searching...</p>
+<p id="activeNote"></p>
+
+<script>
+let audioCtx, masterGain, sampleBuffer;
+const active = {};
+
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new AudioContext();
+  masterGain = audioCtx.createGain();
+  masterGain.connect(audioCtx.destination);
+}
+
+document.getElementById('fileInput').addEventListener('change', async e => {
+  initAudio();
+  const file = e.target.files[0];
+  if (!file) return;
+  document.getElementById('status').textContent = 'Loading...';
+  try {
+    sampleBuffer = await audioCtx.decodeAudioData(await file.arrayBuffer());
+    document.getElementById('status').textContent = `Loaded: ${file.name} (${sampleBuffer.duration.toFixed(2)}s)`;
+  } catch {
+    document.getElementById('status').textContent = 'Error loading file.';
+  }
+});
+
+document.getElementById('volume').addEventListener('input', e => {
+  if (masterGain) masterGain.gain.value = e.target.value;
+});
+
+function noteToName(n) {
+  return ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][n % 12] + (Math.floor(n / 12) - 1);
+}
+
+function playNote(midi) {
+  if (!sampleBuffer) return;
+  if (active[midi]) stopNote(midi);
+  const root = parseInt(document.getElementById('rootNote').value);
+  const src = audioCtx.createBufferSource();
+  src.buffer = sampleBuffer;
+  src.loop = document.getElementById('loop').checked;
+  src.playbackRate.value = Math.pow(2, (midi - root) / 12);
+  src.connect(masterGain);
+  src.start();
+  active[midi] = src;
+  document.getElementById('activeNote').textContent = `Playing: ${noteToName(midi)} (MIDI ${midi})`;
+}
+
+function stopNote(midi) {
+  if (!active[midi]) return;
+  active[midi].stop();
+  delete active[midi];
+  document.getElementById('activeNote').textContent = '';
+}
+
+// Computer keyboard mapping (A W S E D F T G Y H U J K = one octave from C)
+let octave = 4;
+const keyMap = { a:0,w:1,s:2,e:3,d:4,f:5,t:6,g:7,y:8,h:9,u:10,j:11,k:12 };
+
+document.addEventListener('keydown', e => {
+  if (e.repeat || e.target.tagName === 'INPUT') return;
+  const semi = keyMap[e.key.toLowerCase()];
+  if (semi === undefined) return;
+  initAudio();
+  playNote(octave * 12 + semi);
+});
+
+document.addEventListener('keyup', e => {
+  const semi = keyMap[e.key.toLowerCase()];
+  if (semi === undefined) return;
+  stopNote(octave * 12 + semi);
+});
+
+// MIDI
+if (navigator.requestMIDIAccess) {
+  navigator.requestMIDIAccess().then(access => {
+    function connect() {
+      const inputs = [...access.inputs.values()];
+      inputs.forEach(i => i.onmidimessage = e => {
+        const [cmd, note, vel] = e.data;
+        initAudio();
+        if ((cmd & 0xf0) === 0x90 && vel > 0) playNote(note);
+        else if ((cmd & 0xf0) === 0x80 || ((cmd & 0xf0) === 0x90 && vel === 0)) stopNote(note);
+      });
+      document.getElementById('midiStatus').textContent =
+        inputs.length ? `MIDI: ${inputs[0].name}` : 'MIDI: no device found';
+    }
+    connect();
+    access.onstatechange = connect;
+  }).catch(() => {
+    document.getElementById('midiStatus').textContent = 'MIDI: permission denied';
+  });
+} else {
+  document.getElementById('midiStatus').textContent = 'MIDI: not supported in this browser';
+}
+</script>
+</body>
+</html>
