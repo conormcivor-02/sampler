@@ -5,13 +5,40 @@
 <title>Sampler Prototype</title>
 </head>
 <body>
-<h2>Pitch Sampler</h2>
+<h2>Sampler Prototype</h2>
 
+<!-- File -->
 <input type="file" id="fileInput" accept="audio/*"><br><br>
 
-<label>Root Note (MIDI): <input type="number" id="rootNote" value="60" min="0" max="127"> (60 = C4)</label><br><br>
+<!-- Mode -->
+<label>Mode:
+  <select id="mode">
+    <option value="pitch">Pitch Mode — keys play same sample at different pitches</option>
+    <option value="slice">Slice Mode — keys play different chunks of the sample</option>
+  </select>
+</label><br><br>
+
+<!-- Pitch mode controls -->
+<div id="pitchControls">
+  <label>Root Note (MIDI): <input type="number" id="rootNote" value="60" min="0" max="127"> (60 = C4)</label><br><br>
+</div>
+
+<!-- Slice mode controls -->
+<div id="sliceControls" style="display:none">
+  <label>Slice interval (ms): <input type="number" id="sliceInterval" value="500" min="1" step="1"></label>
+  &nbsp;&nbsp;
+  <label>Start key (MIDI): <input type="number" id="startKey" value="36" min="0" max="127"> (36 = C2)</label>
+  &nbsp;&nbsp;
+  <button id="resliceBtn">Re-slice</button><br><br>
+  <label>Slices: <span id="sliceCount">—</span></label><br><br>
+  <canvas id="waveform" width="700" height="80" style="border:1px solid #ccc; display:block; margin-bottom:6px;"></canvas>
+  <p style="font-size:12px; color:#666;">Each coloured band = one slice mapped to a key.</p><br>
+</div>
+
+<!-- Shared -->
 <label>Volume: <input type="range" id="volume" min="0" max="2" step="0.01" value="1"></label><br><br>
-<label>Loop: <input type="checkbox" id="loop"></label><br><br>
+<label>Loop slice: <input type="checkbox" id="loop"></label><br><br>
+<label>Playthrough: <input type="checkbox" id="playThrough"></label><br><br>
 
 <p id="status">Load a sample to begin.</p>
 <p id="midiStatus">MIDI: searching...</p>
@@ -20,6 +47,7 @@
 <script>
 let audioCtx, masterGain, sampleBuffer;
 const active = {};
+let slices = [];
 
 function initAudio() {
   if (audioCtx) return;
@@ -28,6 +56,7 @@ function initAudio() {
   masterGain.connect(audioCtx.destination);
 }
 
+// ── File load ──────────────────────────────────────────────────────────────────
 document.getElementById('fileInput').addEventListener('change', async e => {
   initAudio();
   const file = e.target.files[0];
@@ -35,47 +64,198 @@ document.getElementById('fileInput').addEventListener('change', async e => {
   document.getElementById('status').textContent = 'Loading...';
   try {
     sampleBuffer = await audioCtx.decodeAudioData(await file.arrayBuffer());
-    document.getElementById('status').textContent = `Loaded: ${file.name} (${sampleBuffer.duration.toFixed(2)}s)`;
+    document.getElementById('status').textContent =
+      `Loaded: ${file.name}  (${sampleBuffer.duration.toFixed(3)}s)`;
+    buildSlices();
   } catch {
-    document.getElementById('status').textContent = 'Error loading file.';
+    document.getElementById('status').textContent = 'Error decoding audio.';
   }
+});
+
+// ── Slicing ────────────────────────────────────────────────────────────────────
+function buildSlices() {
+  if (!sampleBuffer) return;
+  const intervalSec = parseFloat(document.getElementById('sliceInterval').value) / 1000;
+  const dur = sampleBuffer.duration;
+  slices = [];
+  for (let t = 0; t < dur; t += intervalSec) {
+    slices.push({ start: t, end: Math.min(t + intervalSec, dur) });
+  }
+  document.getElementById('sliceCount').textContent = slices.length;
+  drawWaveform();
+}
+
+document.getElementById('resliceBtn').addEventListener('click', buildSlices);
+document.getElementById('sliceInterval').addEventListener('change', buildSlices);
+document.getElementById('startKey').addEventListener('change', drawWaveform);
+
+// ── Waveform + slice overlay ───────────────────────────────────────────────────
+const COLORS = ['#e74c3c','#e67e22','#f1c40f','#27ae60','#16a085','#2980b9','#8e44ad','#c0392b'];
+
+function noteToName(n) {
+  return ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][n % 12] + (Math.floor(n / 12) - 1);
+}
+
+function drawWaveform(highlightSlice = -1) {
+  if (!sampleBuffer) return;
+  const canvas = document.getElementById('waveform');
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  const data = sampleBuffer.getChannelData(0);
+  const dur = sampleBuffer.duration;
+  const startKey = parseInt(document.getElementById('startKey').value);
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#f5f5f5';
+  ctx.fillRect(0, 0, W, H);
+
+  // Slice bands
+  slices.forEach((sl, i) => {
+    const x1 = (sl.start / dur) * W;
+    const x2 = (sl.end / dur) * W;
+    const col = COLORS[i % COLORS.length];
+    ctx.fillStyle = i === highlightSlice ? col + '88' : col + '28';
+    ctx.fillRect(x1, 0, x2 - x1, H);
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(x1, 0); ctx.lineTo(x1, H); ctx.stroke();
+    if (x2 - x1 > 16) {
+      ctx.fillStyle = '#222';
+      ctx.font = '9px monospace';
+      ctx.fillText(noteToName(startKey + i), x1 + 3, 11);
+    }
+  });
+
+  // Waveform
+  ctx.strokeStyle = '#333';
+  ctx.lineWidth = 1;
+  const step = Math.max(1, Math.floor(data.length / W));
+  const amp = H / 2;
+  ctx.beginPath();
+  for (let i = 0; i < W; i++) {
+    let min = 1, max = -1;
+    for (let j = 0; j < step; j++) {
+      const d = data[i * step + j] || 0;
+      if (d < min) min = d;
+      if (d > max) max = d;
+    }
+    ctx.moveTo(i, (1 + min) * amp);
+    ctx.lineTo(i, (1 + max) * amp);
+  }
+  ctx.stroke();
+}
+
+function playNote(midi) {
+  if (!sampleBuffer) return;
+  
+  if (active[midi]) stopNote(midi);
+
+  const mode = document.getElementById('mode').value;
+
+  if (mode === 'slice') {
+    for (let key in active) {
+      stopNote(key);
+    }
+  }
+
+  const src = audioCtx.createBufferSource();
+  const voiceGain = audioCtx.createGain(); 
+
+  src.buffer = sampleBuffer;
+  src.loop = document.getElementById('loop').checked;
+
+  src.connect(voiceGain);
+  voiceGain.connect(masterGain);
+
+  if (mode === 'pitch') {
+    const root = parseInt(document.getElementById('rootNote').value);
+    src.playbackRate.value = Math.pow(2, (midi - root) / 12);
+    src.start();
+    document.getElementById('activeNote').textContent =
+      `Playing: ${noteToName(midi)} (MIDI ${midi})`;
+  } else {
+    // --- SLICE MODE ---
+    const startKey = parseInt(document.getElementById('startKey').value);
+    const idx = midi - startKey;
+    if (idx < 0 || idx >= slices.length) return;
+    
+    const sl = slices[idx];
+    const playThrough = document.getElementById('playThrough').checked;
+    
+    // Check looping and play through states
+    if (src.loop && !playThrough) {
+      // Loop just the specific slice
+      src.loopStart = sl.start;
+      src.loopEnd = sl.end;
+      src.start(0, sl.start); 
+    } else if (playThrough) {
+      // Play Through Mode: Start at the slice, but let it ride to the end of the sample
+      src.start(0, sl.start);
+    } else {
+      // Standard Mode: Play exact duration of the slice and stop
+      src.start(0, sl.start, sl.end - sl.start);
+    }
+
+    document.getElementById('activeNote').textContent =
+      `Playing slice ${idx}  |  ${noteToName(midi)} (MIDI ${midi})`;
+    drawWaveform(idx);
+  }
+
+  active[midi] = { src: src, gain: voiceGain, isStopping: false };
+}
+
+function stopNote(midi) {
+  if (!active[midi]) return;
+
+  const voice = active[midi];
+  
+  // Prevent multiple stop calls from overlapping on the same voice
+  if (voice.isStopping) return;
+  voice.isStopping = true;
+
+  // 30ms fade out
+  const fadeOutTime = 0.03; 
+  const now = audioCtx.currentTime;
+
+  // Smoothly fade volume to 0
+  voice.gain.gain.setValueAtTime(voice.gain.gain.value, now);
+  voice.gain.gain.linearRampToValueAtTime(0.001, now + fadeOutTime);
+
+  // Stop the audio slightly AFTER the fade finishes
+  setTimeout(() => {
+    try { voice.src.stop(); } catch {}
+    voice.gain.disconnect(); 
+    
+    // THE FIX: Only delete this note from the active list if it hasn't 
+    // already been overwritten by a brand new key press!
+    if (active[midi] === voice) {
+      delete active[midi];
+
+      // Only clear the UI text if no other notes are currently playing
+      if (Object.keys(active).length === 0) {
+        document.getElementById('activeNote').textContent = '';
+        if (document.getElementById('mode').value === 'slice') drawWaveform();
+      }
+    }
+  }, fadeOutTime * 1000 + 10);
+}
+
+// ── Controls ───────────────────────────────────────────────────────────────────
+document.getElementById('mode').addEventListener('change', e => {
+  document.getElementById('pitchControls').style.display = e.target.value === 'pitch' ? '' : 'none';
+  document.getElementById('sliceControls').style.display  = e.target.value === 'slice' ? '' : 'none';
 });
 
 document.getElementById('volume').addEventListener('input', e => {
   if (masterGain) masterGain.gain.value = e.target.value;
 });
 
-function noteToName(n) {
-  return ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'][n % 12] + (Math.floor(n / 12) - 1);
-}
-
-function playNote(midi) {
-  if (!sampleBuffer) return;
-  if (active[midi]) stopNote(midi);
-  const root = parseInt(document.getElementById('rootNote').value);
-  const src = audioCtx.createBufferSource();
-  src.buffer = sampleBuffer;
-  src.loop = document.getElementById('loop').checked;
-  src.playbackRate.value = Math.pow(2, (midi - root) / 12);
-  src.connect(masterGain);
-  src.start();
-  active[midi] = src;
-  document.getElementById('activeNote').textContent = `Playing: ${noteToName(midi)} (MIDI ${midi})`;
-}
-
-function stopNote(midi) {
-  if (!active[midi]) return;
-  active[midi].stop();
-  delete active[midi];
-  document.getElementById('activeNote').textContent = '';
-}
-
-// Computer keyboard mapping (A W S E D F T G Y H U J K = one octave from C)
-let octave = 4;
+// ── Computer keyboard ──────────────────────────────────────────────────────────
+const octave = 4;
 const keyMap = { a:0,w:1,s:2,e:3,d:4,f:5,t:6,g:7,y:8,h:9,u:10,j:11,k:12 };
 
 document.addEventListener('keydown', e => {
-  if (e.repeat || e.target.tagName === 'INPUT') return;
+  if (e.repeat || ['INPUT','SELECT'].includes(e.target.tagName)) return;
   const semi = keyMap[e.key.toLowerCase()];
   if (semi === undefined) return;
   initAudio();
@@ -88,17 +268,17 @@ document.addEventListener('keyup', e => {
   stopNote(octave * 12 + semi);
 });
 
-// MIDI
+// ── MIDI ───────────────────────────────────────────────────────────────────────
 if (navigator.requestMIDIAccess) {
   navigator.requestMIDIAccess().then(access => {
     function connect() {
-      const inputs = [...access.inputs.values()];
-      inputs.forEach(i => i.onmidimessage = e => {
+      [...access.inputs.values()].forEach(i => i.onmidimessage = e => {
         const [cmd, note, vel] = e.data;
         initAudio();
         if ((cmd & 0xf0) === 0x90 && vel > 0) playNote(note);
         else if ((cmd & 0xf0) === 0x80 || ((cmd & 0xf0) === 0x90 && vel === 0)) stopNote(note);
       });
+      const inputs = [...access.inputs.values()];
       document.getElementById('midiStatus').textContent =
         inputs.length ? `MIDI: ${inputs[0].name}` : 'MIDI: no device found';
     }
