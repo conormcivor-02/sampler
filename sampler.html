@@ -7,10 +7,16 @@
 <body>
 <h2>Sampler Prototype</h2>
 
-<!-- File -->
-<input type="file" id="fileInput" accept="audio/*"><br><br>
+<label>Metronome: <input type="checkbox" id="metroToggle"></label>
+&nbsp;&nbsp;
+<label>BPM: <input type="number" id="metroBPM" value="120" min="40" max="300" style="width: 60px;"></label><br><br>
 
-<!-- Mode -->
+<input type="file" id="fileInput" accept="audio/*">
+&nbsp;OR&nbsp;
+<button id="recordBtn">🎤 Record</button>
+<span id="recordStatus" style="color: red; display: none; font-weight: bold;">🔴 Recording...</span>
+<br><br>
+
 <label>Mode:
   <select id="mode">
     <option value="pitch">Pitch Mode — keys play same sample at different pitches</option>
@@ -18,12 +24,10 @@
   </select>
 </label><br><br>
 
-<!-- Pitch mode controls -->
 <div id="pitchControls">
   <label>Root Note (MIDI): <input type="number" id="rootNote" value="60" min="0" max="127"> (60 = C4)</label><br><br>
 </div>
 
-<!-- Slice mode controls -->
 <div id="sliceControls" style="display:none">
   <label>Slice interval (ms): <input type="number" id="sliceInterval" value="500" min="1" step="1"></label>
   &nbsp;&nbsp;
@@ -35,17 +39,18 @@
   <p style="font-size:12px; color:#666;">Each coloured band = one slice mapped to a key.</p><br>
 </div>
 
-<!-- Shared -->
 <label>Volume: <input type="range" id="volume" min="0" max="2" step="0.01" value="1"></label><br><br>
 <label>Loop slice: <input type="checkbox" id="loop"></label><br><br>
 <label>Playthrough: <input type="checkbox" id="playThrough"></label><br><br>
+<label>One-Shot: <input type="checkbox" id="oneShot"></label><br><br>
+<label>Reverse playback: <input type="checkbox" id="reversePlayback"></label><br><br>
 
 <p id="status">Load a sample to begin.</p>
 <p id="midiStatus">MIDI: searching...</p>
 <p id="activeNote"></p>
 
 <script>
-let audioCtx, masterGain, sampleBuffer;
+let audioCtx, masterGain, sampleBuffer, reversedSampleBuffer;
 const active = {};
 let slices = [];
 
@@ -56,6 +61,16 @@ function initAudio() {
   masterGain.connect(audioCtx.destination);
 }
 
+// ── Reverse Array Helper ───────────────────────────────────────────────────────
+function reverseBuffer(buffer) {
+  if (!buffer) return null;
+  const rev = audioCtx.createBuffer(buffer.numberOfChannels, buffer.length, buffer.sampleRate);
+  for (let i = 0; i < buffer.numberOfChannels; i++) {
+    rev.getChannelData(i).set(buffer.getChannelData(i).slice().reverse());
+  }
+  return rev;
+}
+
 // ── File load ──────────────────────────────────────────────────────────────────
 document.getElementById('fileInput').addEventListener('change', async e => {
   initAudio();
@@ -64,11 +79,65 @@ document.getElementById('fileInput').addEventListener('change', async e => {
   document.getElementById('status').textContent = 'Loading...';
   try {
     sampleBuffer = await audioCtx.decodeAudioData(await file.arrayBuffer());
+    reversedSampleBuffer = reverseBuffer(sampleBuffer);
     document.getElementById('status').textContent =
       `Loaded: ${file.name}  (${sampleBuffer.duration.toFixed(3)}s)`;
     buildSlices();
   } catch {
     document.getElementById('status').textContent = 'Error decoding audio.';
+  }
+});
+
+// ── Live Recording ─────────────────────────────────────────────────────────────
+let mediaRecorder;
+let recordedChunks = [];
+let isRecording = false;
+
+document.getElementById('recordBtn').addEventListener('click', async () => {
+  initAudio(); 
+
+  if (isRecording) {
+    mediaRecorder.stop();
+    document.getElementById('recordBtn').textContent = '🎤 Record';
+    document.getElementById('recordStatus').style.display = 'none';
+    isRecording = false;
+    return;
+  }
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+    recordedChunks = [];
+
+    mediaRecorder.ondataavailable = e => {
+      if (e.data.size > 0) recordedChunks.push(e.data);
+    };
+
+    mediaRecorder.onstop = async () => {
+      document.getElementById('status').textContent = 'Processing recording...';
+      const blob = new Blob(recordedChunks, { type: 'audio/webm' }); 
+      
+      try {
+        const arrayBuffer = await blob.arrayBuffer();
+        sampleBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+        reversedSampleBuffer = reverseBuffer(sampleBuffer);
+        document.getElementById('status').textContent = 
+          `Recorded Audio Loaded (${sampleBuffer.duration.toFixed(3)}s)`;
+        buildSlices();
+      } catch (err) {
+        document.getElementById('status').textContent = 'Error decoding microphone audio.';
+      }
+
+      stream.getTracks().forEach(track => track.stop());
+    };
+
+    mediaRecorder.start();
+    document.getElementById('recordBtn').textContent = '⏹ Stop';
+    document.getElementById('recordStatus').style.display = 'inline';
+    isRecording = true;
+
+  } catch (err) {
+    document.getElementById('status').textContent = 'Microphone access denied or unavailable.';
   }
 });
 
@@ -151,6 +220,7 @@ function playNote(midi) {
   if (active[midi]) stopNote(midi);
 
   const mode = document.getElementById('mode').value;
+  const isReverse = document.getElementById('reversePlayback').checked;
 
   if (mode === 'slice') {
     for (let key in active) {
@@ -161,18 +231,35 @@ function playNote(midi) {
   const src = audioCtx.createBufferSource();
   const voiceGain = audioCtx.createGain(); 
 
-  src.buffer = sampleBuffer;
+  // Use the reversed buffer if checked, otherwise original
+  if (isReverse && reversedSampleBuffer) {
+    src.buffer = reversedSampleBuffer;
+  } else {
+    src.buffer = sampleBuffer;
+  }
+  
   src.loop = document.getElementById('loop').checked;
 
   src.connect(voiceGain);
   voiceGain.connect(masterGain);
+
+  src.onended = () => {
+    if (active[midi] && active[midi].src === src && !active[midi].isStopping) {
+      active[midi].gain.disconnect();
+      delete active[midi];
+      if (Object.keys(active).length === 0) {
+        document.getElementById('activeNote').textContent = '';
+        if (document.getElementById('mode').value === 'slice') drawWaveform();
+      }
+    }
+  };
 
   if (mode === 'pitch') {
     const root = parseInt(document.getElementById('rootNote').value);
     src.playbackRate.value = Math.pow(2, (midi - root) / 12);
     src.start();
     document.getElementById('activeNote').textContent =
-      `Playing: ${noteToName(midi)} (MIDI ${midi})`;
+      `Playing: ${noteToName(midi)} (MIDI ${midi}) ${isReverse ? '[REV]' : ''}`;
   } else {
     // --- SLICE MODE ---
     const startKey = parseInt(document.getElementById('startKey').value);
@@ -182,22 +269,31 @@ function playNote(midi) {
     const sl = slices[idx];
     const playThrough = document.getElementById('playThrough').checked;
     
+    // Calculate start/end based on whether we are moving forward or backward
+    let slStart = sl.start;
+    let slEnd = sl.end;
+    
+    if (isReverse) {
+      slStart = sampleBuffer.duration - sl.end;
+      slEnd = sampleBuffer.duration - sl.start;
+    }
+    
     // Check looping and play through states
     if (src.loop && !playThrough) {
       // Loop just the specific slice
-      src.loopStart = sl.start;
-      src.loopEnd = sl.end;
-      src.start(0, sl.start); 
+      src.loopStart = slStart;
+      src.loopEnd = slEnd;
+      src.start(0, slStart); 
     } else if (playThrough) {
-      // Play Through Mode: Start at the slice, but let it ride to the end of the sample
-      src.start(0, sl.start);
+      // Play Through Mode: Start at the slice, let it ride to the end of the buffer
+      src.start(0, slStart);
     } else {
       // Standard Mode: Play exact duration of the slice and stop
-      src.start(0, sl.start, sl.end - sl.start);
+      src.start(0, slStart, slEnd - slStart);
     }
 
     document.getElementById('activeNote').textContent =
-      `Playing slice ${idx}  |  ${noteToName(midi)} (MIDI ${midi})`;
+      `Playing slice ${idx} ${isReverse ? '[REV]' : ''} |  ${noteToName(midi)} (MIDI ${midi})`;
     drawWaveform(idx);
   }
 
@@ -250,6 +346,58 @@ document.getElementById('volume').addEventListener('input', e => {
   if (masterGain) masterGain.gain.value = e.target.value;
 });
 
+// ── Metronome ──────────────────────────────────────────────────────────────────
+let isMetroPlaying = false;
+let currentBeat = 0;
+let nextBeatTime = 0.0;
+let metroInterval;
+
+function nextBeat() {
+  const bpm = parseInt(document.getElementById('metroBPM').value) || 120;
+  const secondsPerBeat = 60.0 / bpm;
+  nextBeatTime += secondsPerBeat;
+  currentBeat = (currentBeat + 1) % 4; // 4/4 time signature
+}
+
+function scheduleBeat(beatNumber, time) {
+  const osc = audioCtx.createOscillator();
+  const oscGain = audioCtx.createGain();
+  
+  osc.connect(oscGain);
+  oscGain.connect(masterGain);
+  
+  // High pitched "tick" on the downbeat (beat 0), lower pitch on other beats
+  osc.frequency.value = (beatNumber === 0) ? 880 : 440; 
+  
+  // Short 50ms beep with a quick fade out to avoid clicks
+  osc.start(time);
+  osc.stop(time + 0.05);
+  
+  oscGain.gain.setValueAtTime(1, time);
+  oscGain.gain.exponentialRampToValueAtTime(0.001, time + 0.05);
+}
+
+function metroScheduler() {
+  // Schedule any beats that need to play in the next 100ms
+  while (nextBeatTime < audioCtx.currentTime + 0.1) {
+    scheduleBeat(currentBeat, nextBeatTime);
+    nextBeat();
+  }
+}
+
+document.getElementById('metroToggle').addEventListener('change', e => {
+  initAudio();
+  isMetroPlaying = e.target.checked;
+  
+  if (isMetroPlaying) {
+    currentBeat = 0;
+    nextBeatTime = audioCtx.currentTime + 0.05; // Start just slightly in the future
+    metroInterval = setInterval(metroScheduler, 25);
+  } else {
+    clearInterval(metroInterval);
+  }
+});
+
 // ── Computer keyboard ──────────────────────────────────────────────────────────
 const octave = 4;
 const keyMap = { a:0,w:1,s:2,e:3,d:4,f:5,t:6,g:7,y:8,h:9,u:10,j:11,k:12 };
@@ -265,6 +413,7 @@ document.addEventListener('keydown', e => {
 document.addEventListener('keyup', e => {
   const semi = keyMap[e.key.toLowerCase()];
   if (semi === undefined) return;
+  if (document.getElementById('oneShot').checked) return;
   stopNote(octave * 12 + semi);
 });
 
@@ -275,8 +424,13 @@ if (navigator.requestMIDIAccess) {
       [...access.inputs.values()].forEach(i => i.onmidimessage = e => {
         const [cmd, note, vel] = e.data;
         initAudio();
-        if ((cmd & 0xf0) === 0x90 && vel > 0) playNote(note);
-        else if ((cmd & 0xf0) === 0x80 || ((cmd & 0xf0) === 0x90 && vel === 0)) stopNote(note);
+        if ((cmd & 0xf0) === 0x90 && vel > 0) {
+          playNote(note);
+        } else if ((cmd & 0xf0) === 0x80 || ((cmd & 0xf0) === 0x90 && vel === 0)) {
+          if (!document.getElementById('oneShot').checked) {
+            stopNote(note);
+          }
+        }
       });
       const inputs = [...access.inputs.values()];
       document.getElementById('midiStatus').textContent =
