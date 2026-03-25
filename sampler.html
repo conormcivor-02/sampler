@@ -3,6 +3,23 @@
 <head>
 <meta charset="UTF-8">
 <title>Sampler Prototype</title>
+<style>
+  /* Base styling for the drag-and-drop sequencer */
+  .seq-slot {
+    width: 40px;
+    height: 40px;
+    border: 1px solid #999;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: bold;
+    font-family: monospace;
+    transition: transform 0.1s, opacity 0.1s;
+  }
+  .seq-slot.downbeat {
+    background-color: #eee;
+  }
+</style>
 </head>
 <body>
 <h2>Sampler Prototype</h2>
@@ -31,12 +48,17 @@
 <div id="sliceControls" style="display:none">
   <label>Slice interval (ms): <input type="number" id="sliceInterval" value="500" min="1" step="1"></label>
   &nbsp;&nbsp;
-  <label>Start key (MIDI): <input type="number" id="startKey" value="36" min="0" max="127"> (36 = C2)</label>
+  <label>Start key (MIDI): <input type="number" id="startKey" value="60" min="0" max="127"> (60 = C4)</label>
   &nbsp;&nbsp;
   <button id="resliceBtn">Auto Re-slice</button>
   <button id="clearSlicesBtn">Clear Slices (Start Fresh)</button><br><br>
   <label>Slices: <span id="sliceCount">—</span></label><br><br>
-  <canvas id="waveform" width="700" height="80" style="border:1px solid #ccc; display:block; margin-bottom:6px;"></canvas>
+  
+  <div style="position: relative; width: 700px; height: 80px; margin-bottom: 6px;">
+    <canvas id="waveform" width="700" height="80" style="border:1px solid #ccc; position: absolute; top: 0; left: 0; z-index: 1;"></canvas>
+    <canvas id="playheadOverlay" width="700" height="80" style="position: absolute; top: 0; left: 0; z-index: 2; pointer-events: none;"></canvas>
+  </div>
+  
   <p style="font-size:12px; color:#666;">Each coloured band = one slice. <b>Hover & drag lines</b> to adjust. <b>Double-click</b> inside a slice to split it.</p><br>
 </div>
 
@@ -45,6 +67,32 @@
 <label>Playthrough: <input type="checkbox" id="playThrough"></label><br><br>
 <label>One-Shot: <input type="checkbox" id="oneShot"></label><br><br>
 <label>Reverse playback: <input type="checkbox" id="reversePlayback"></label><br><br>
+
+<hr>
+
+<h3>16-Step Sequencer</h3>
+<p style="font-size:12px; color:#666;"><b>Drag</b> slices from the Palette into the Track. <b>Right-click</b> a track slot to clear it.</p>
+
+<div style="margin-bottom: 10px;">
+  <strong>Palette (Available Slices):</strong>
+  <div id="palette" style="display: flex; gap: 5px; margin-top: 5px; min-height: 30px; padding: 5px; border: 1px dashed #ccc; overflow-x: auto;">
+    </div>
+</div>
+
+<div style="margin-bottom: 15px;">
+  <strong>Sequence Track:</strong>
+  <label style="font-size:12px; margin-left:15px; font-weight:normal; cursor:pointer;">
+    <input type="checkbox" id="seqChoke" checked> Monophonic (Cut off previous slice)
+  </label>
+  <div id="track" style="display: flex; gap: 5px; margin-top: 5px;">
+    </div>
+</div>
+
+<button id="playSeqBtn" style="background-color: #2ecc71; color: white; border: none; padding: 5px 10px; cursor: pointer;">Play Sequence</button>
+<button id="stopSeqBtn" style="background-color: #e74c3c; color: white; border: none; padding: 5px 10px; cursor: pointer;">Stop Sequence</button>
+<button id="clearSeqBtn">Clear Sequence</button><br><br>
+
+<hr>
 
 <p id="status">Load a sample to begin.</p>
 <p id="midiStatus">MIDI: searching...</p>
@@ -161,7 +209,6 @@ document.getElementById('startKey').addEventListener('change', drawWaveform);
 
 document.getElementById('clearSlicesBtn').addEventListener('click', () => {
   if (!sampleBuffer) return;
-  // Reset to a single slice encompassing the entire sample
   slices = [{ start: 0, end: sampleBuffer.duration }];
   document.getElementById('sliceCount').textContent = slices.length;
   drawWaveform();
@@ -187,7 +234,6 @@ function drawWaveform(highlightSlice = -1) {
   ctx.fillStyle = '#f5f5f5';
   ctx.fillRect(0, 0, W, H);
 
-  // Slice bands
   slices.forEach((sl, i) => {
     const x1 = (sl.start / dur) * W;
     const x2 = (sl.end / dur) * W;
@@ -204,7 +250,6 @@ function drawWaveform(highlightSlice = -1) {
     }
   });
 
-  // Waveform
   ctx.strokeStyle = '#333';
   ctx.lineWidth = 1;
   const step = Math.max(1, Math.floor(data.length / W));
@@ -221,6 +266,10 @@ function drawWaveform(highlightSlice = -1) {
     ctx.lineTo(i, (1 + max) * amp);
   }
   ctx.stroke();
+
+  // Update the Drag-and-Drop sequencer UI whenever slices change
+  renderPalette();
+  renderTrack();
 }
 
 // ── Interactive Slice Dragging & Splitting ─────────────────────────────────────
@@ -234,7 +283,6 @@ canvasEl.addEventListener('mousedown', e => {
   const W = canvasEl.width;
   const dur = sampleBuffer.duration;
 
-  // Check if we clicked near any slice boundary (except the very first and last)
   for (let i = 1; i < slices.length; i++) {
     const markerX = (slices[i].start / dur) * W;
     if (Math.abs(x - markerX) < 6) { 
@@ -251,16 +299,12 @@ canvasEl.addEventListener('mousemove', e => {
   const W = canvasEl.width;
   const dur = sampleBuffer.duration;
 
-  // Handle Dragging
   if (draggedMarker !== -1) {
     let t = (x / W) * dur;
-    
-    // Constrain the drag so it can't cross the previous or next slice markers
     const minT = slices[draggedMarker - 1].start + 0.01; 
     const maxT = slices[draggedMarker].end - 0.01;
     t = Math.max(minT, Math.min(t, maxT));
     
-    // Update the boundary
     slices[draggedMarker].start = t;
     slices[draggedMarker - 1].end = t;
     
@@ -268,7 +312,6 @@ canvasEl.addEventListener('mousemove', e => {
     return;
   }
 
-  // Handle Hover state 
   let hover = false;
   for (let i = 1; i < slices.length; i++) {
     const markerX = (slices[i].start / dur) * W;
@@ -283,7 +326,6 @@ canvasEl.addEventListener('mousemove', e => {
 canvasEl.addEventListener('mouseup', () => draggedMarker = -1);
 canvasEl.addEventListener('mouseleave', () => draggedMarker = -1);
 
-// Add New Slice on Double-Click
 canvasEl.addEventListener('dblclick', e => {
   if (!sampleBuffer) return;
   const rect = canvasEl.getBoundingClientRect();
@@ -291,20 +333,72 @@ canvasEl.addEventListener('dblclick', e => {
   const W = canvasEl.width;
   const t = (x / W) * sampleBuffer.duration;
 
-  // Find which slice we clicked inside and split it
   for (let i = 0; i < slices.length; i++) {
     if (t > slices[i].start && t < slices[i].end) {
       const oldEnd = slices[i].end;
       slices[i].end = t;
-      // Insert the new slice right after the current one
       slices.splice(i + 1, 0, { start: t, end: oldEnd });
-      
       document.getElementById('sliceCount').textContent = slices.length;
       drawWaveform();
       break;
     }
   }
 });
+
+// ── Playhead Animation Loop ────────────────────────────────────────────────────
+function drawPlayheads() {
+  requestAnimationFrame(drawPlayheads);
+  
+  const canvas = document.getElementById('playheadOverlay');
+  if (!canvas || !sampleBuffer) return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width, H = canvas.height;
+  
+  ctx.clearRect(0, 0, W, H);
+  
+  const now = audioCtx ? audioCtx.currentTime : 0;
+  const dur = sampleBuffer.duration;
+
+  for (let midi in active) {
+    const voice = active[midi];
+    if (voice.isStopping) continue;
+
+    const elapsed = now - voice.startTime;
+    let t;
+
+    if (voice.isReverse) {
+      t = voice.startOffset - (elapsed * voice.rate);
+      if (voice.isLooping && !voice.playThrough) {
+        const loopLen = voice.loopEnd - voice.loopStart;
+        if (loopLen > 0) {
+          while (t < voice.loopStart) t += loopLen;
+        }
+      }
+    } else {
+      t = voice.startOffset + (elapsed * voice.rate);
+      if (voice.isLooping && !voice.playThrough) {
+        const loopLen = voice.loopEnd - voice.loopStart;
+        if (loopLen > 0) {
+          while (t > voice.loopEnd) t -= loopLen;
+        }
+      }
+    }
+
+    if (t >= 0 && t <= dur) {
+      const x = (t / dur) * W;
+      
+      ctx.fillStyle = '#ff3333';
+      ctx.fillRect(x - 1, 0, 2, H);
+      
+      ctx.beginPath();
+      ctx.moveTo(x - 5, 0);
+      ctx.lineTo(x + 5, 0);
+      ctx.lineTo(x, 6);
+      ctx.fill();
+    }
+  }
+}
+drawPlayheads();
 
 // ── Playback ───────────────────────────────────────────────────────────────────
 function playNote(midi) {
@@ -331,7 +425,6 @@ function playNote(midi) {
   }
   
   src.loop = document.getElementById('loop').checked;
-
   src.connect(voiceGain);
   voiceGain.connect(masterGain);
 
@@ -346,9 +439,18 @@ function playNote(midi) {
     }
   };
 
+  let startOffset = 0;
+  let playRate = 1;
+  let loopS = 0;
+  let loopE = sampleBuffer.duration;
+
   if (mode === 'pitch') {
     const root = parseInt(document.getElementById('rootNote').value);
-    src.playbackRate.value = Math.pow(2, (midi - root) / 12);
+    playRate = Math.pow(2, (midi - root) / 12);
+    src.playbackRate.value = playRate;
+    
+    if (isReverse) startOffset = sampleBuffer.duration;
+    
     src.start();
     document.getElementById('activeNote').textContent =
       `Playing: ${noteToName(midi)} (MIDI ${midi}) ${isReverse ? '[REV]' : ''}`;
@@ -366,6 +468,13 @@ function playNote(midi) {
     if (isReverse) {
       slStart = sampleBuffer.duration - sl.end;
       slEnd = sampleBuffer.duration - sl.start;
+      startOffset = sl.end; 
+      loopS = sl.start;
+      loopE = sl.end;
+    } else {
+      startOffset = sl.start;
+      loopS = sl.start;
+      loopE = sl.end;
     }
     
     if (src.loop && !playThrough) {
@@ -383,14 +492,25 @@ function playNote(midi) {
     drawWaveform(idx);
   }
 
-  active[midi] = { src: src, gain: voiceGain, isStopping: false };
+  active[midi] = { 
+    src: src, 
+    gain: voiceGain, 
+    isStopping: false,
+    startTime: audioCtx.currentTime,
+    startOffset: startOffset,
+    rate: playRate,
+    isReverse: isReverse,
+    isLooping: src.loop,
+    loopStart: loopS,
+    loopEnd: loopE,
+    playThrough: document.getElementById('playThrough').checked && mode === 'slice'
+  };
 }
 
 function stopNote(midi) {
   if (!active[midi]) return;
 
   const voice = active[midi];
-  
   if (voice.isStopping) return;
   voice.isStopping = true;
 
@@ -406,7 +526,6 @@ function stopNote(midi) {
     
     if (active[midi] === voice) {
       delete active[midi];
-
       if (Object.keys(active).length === 0) {
         document.getElementById('activeNote').textContent = '';
         if (document.getElementById('mode').value === 'slice') drawWaveform();
@@ -425,53 +544,231 @@ document.getElementById('volume').addEventListener('input', e => {
   if (masterGain) masterGain.gain.value = e.target.value;
 });
 
-// ── Metronome ──────────────────────────────────────────────────────────────────
-let isMetroPlaying = false;
-let currentBeat = 0;
-let nextBeatTime = 0.0;
-let metroInterval;
+// ── Drag & Drop Sequencer UI ───────────────────────────────────────────────────
+const NUM_STEPS = 16;
+let sequence = new Array(NUM_STEPS).fill(null);
 
-function nextBeat() {
+function renderPalette() {
+  const pal = document.getElementById('palette');
+  pal.innerHTML = '';
+  slices.forEach((sl, i) => {
+    const el = document.createElement('div');
+    el.textContent = i;
+    el.style.backgroundColor = COLORS[i % COLORS.length];
+    el.style.color = '#fff';
+    el.style.padding = '5px 15px';
+    el.style.cursor = 'grab';
+    el.style.fontWeight = 'bold';
+    el.draggable = true;
+    
+    el.addEventListener('dragstart', e => {
+      e.dataTransfer.setData('text/plain', i);
+    });
+    pal.appendChild(el);
+  });
+}
+
+function initTrack() {
+  const track = document.getElementById('track');
+  track.innerHTML = '';
+  for(let i=0; i<NUM_STEPS; i++) {
+    const slot = document.createElement('div');
+    slot.className = i % 4 === 0 ? 'seq-slot downbeat' : 'seq-slot';
+    
+    slot.addEventListener('dragover', e => e.preventDefault()); 
+    
+    slot.addEventListener('drop', e => {
+      e.preventDefault();
+      const sliceIdx = e.dataTransfer.getData('text/plain');
+      if (sliceIdx !== '') {
+        sequence[i] = parseInt(sliceIdx);
+        renderTrack();
+      }
+    });
+    
+    slot.addEventListener('contextmenu', e => {
+      e.preventDefault();
+      sequence[i] = null;
+      renderTrack();
+    });
+    
+    track.appendChild(slot);
+  }
+}
+
+function renderTrack() {
+  const track = document.getElementById('track');
+  for(let i=0; i<NUM_STEPS; i++) {
+    const slot = track.children[i];
+    const sliceIdx = sequence[i];
+    
+    if (sliceIdx !== null && slices[sliceIdx]) {
+      slot.textContent = sliceIdx;
+      slot.style.backgroundColor = COLORS[sliceIdx % COLORS.length];
+      slot.style.color = '#fff';
+    } else {
+      slot.textContent = '';
+      slot.style.backgroundColor = ''; 
+      if (!slices[sliceIdx]) sequence[i] = null; 
+    }
+  }
+}
+
+document.getElementById('clearSeqBtn').addEventListener('click', () => {
+  sequence.fill(null);
+  renderTrack();
+});
+
+initTrack(); 
+
+// ── Master 16-Step Clock (Metronome + Sequencer) ───────────────────────────────
+let isClockRunning = false;
+let clockMetroEnabled = false;
+let clockSeqEnabled = false;
+let currentStep = 0;
+let nextStepTime = 0.0;
+let clockInterval;
+
+// Tracker for Monophonic Sequence behavior
+let activeSeqVoice = null; 
+
+function triggerScheduledSlice(sliceIdx, time) {
+  if (!sampleBuffer || !slices[sliceIdx]) return;
+  const sl = slices[sliceIdx];
+
+  const src = audioCtx.createBufferSource();
+  const voiceGain = audioCtx.createGain(); 
+  const isReverse = document.getElementById('reversePlayback').checked;
+
+  src.buffer = (isReverse && reversedSampleBuffer) ? reversedSampleBuffer : sampleBuffer;
+  src.connect(voiceGain);
+  voiceGain.connect(masterGain);
+
+  let slStart = sl.start;
+  let slEnd = sl.end;
+  
+  if (isReverse) {
+    slStart = sampleBuffer.duration - sl.end;
+    slEnd = sampleBuffer.duration - sl.start;
+  }
+
+  // CHOKE LOGIC: Cut off the previous sequenced note cleanly
+  const chokeEnabled = document.getElementById('seqChoke').checked;
+  if (chokeEnabled && activeSeqVoice) {
+    const prevGain = activeSeqVoice.gain.gain;
+    const prevSrc = activeSeqVoice.src;
+    const now = audioCtx.currentTime;
+    
+    // Smoothly fade out the old sound strictly before the new sound hits
+    const actionTime = Math.max(now, time);
+    const fadeStart = Math.max(now, actionTime - 0.01);
+    
+    prevGain.setValueAtTime(prevGain.value, fadeStart);
+    prevGain.linearRampToValueAtTime(0.001, actionTime);
+    
+    try { prevSrc.stop(actionTime); } catch(e) {}
+  }
+  
+  src.start(time, slStart, slEnd - slStart);
+  
+  // Save this voice so the NEXT slice knows what to choke
+  activeSeqVoice = { src: src, gain: voiceGain };
+}
+
+function nextStep() {
   const bpm = parseInt(document.getElementById('metroBPM').value) || 120;
-  const secondsPerBeat = 60.0 / bpm;
-  nextBeatTime += secondsPerBeat;
-  currentBeat = (currentBeat + 1) % 4; 
+  const secondsPerStep = (60.0 / bpm) / 4;
+  nextStepTime += secondsPerStep;
+  currentStep = (currentStep + 1) % NUM_STEPS; 
 }
 
 function scheduleBeat(beatNumber, time) {
   const osc = audioCtx.createOscillator();
   const oscGain = audioCtx.createGain();
-  
   osc.connect(oscGain);
   oscGain.connect(masterGain);
-  
   osc.frequency.value = (beatNumber === 0) ? 880 : 440; 
-  
   osc.start(time);
   osc.stop(time + 0.05);
-  
   oscGain.gain.setValueAtTime(1, time);
   oscGain.gain.exponentialRampToValueAtTime(0.001, time + 0.05);
 }
 
-function metroScheduler() {
-  while (nextBeatTime < audioCtx.currentTime + 0.1) {
-    scheduleBeat(currentBeat, nextBeatTime);
-    nextBeat();
+function scheduleStep(stepNumber, time) {
+  if (clockMetroEnabled && stepNumber % 4 === 0) {
+    scheduleBeat(stepNumber / 4, time);
+  }
+
+  if (clockSeqEnabled) {
+    const sliceIdx = sequence[stepNumber];
+    if (sliceIdx !== null) {
+      triggerScheduledSlice(sliceIdx, time);
+    }
+  }
+
+  const timeToPlay = time - audioCtx.currentTime;
+  setTimeout(() => {
+    const track = document.getElementById('track');
+    for(let i=0; i<NUM_STEPS; i++) {
+      track.children[i].style.opacity = (i === stepNumber) ? '1' : '0.6';
+      track.children[i].style.transform = (i === stepNumber) ? 'scale(1.1)' : 'scale(1)';
+    }
+  }, Math.max(0, timeToPlay * 1000));
+}
+
+function clockScheduler() {
+  while (nextStepTime < audioCtx.currentTime + 0.1) {
+    scheduleStep(currentStep, nextStepTime);
+    nextStep();
+  }
+}
+
+function updateClock() {
+  if (clockMetroEnabled || clockSeqEnabled) {
+    if (!isClockRunning) {
+      initAudio();
+      currentStep = 0;
+      nextStepTime = audioCtx.currentTime + 0.05; 
+      clockInterval = setInterval(clockScheduler, 25);
+      isClockRunning = true;
+    }
+  } else {
+    clearInterval(clockInterval);
+    isClockRunning = false;
+    
+    const track = document.getElementById('track');
+    for(let i=0; i<NUM_STEPS; i++) {
+      track.children[i].style.opacity = '1';
+      track.children[i].style.transform = 'scale(1)';
+    }
   }
 }
 
 document.getElementById('metroToggle').addEventListener('change', e => {
-  initAudio();
-  isMetroPlaying = e.target.checked;
+  clockMetroEnabled = e.target.checked;
+  updateClock();
+});
+
+document.getElementById('playSeqBtn').addEventListener('click', () => {
+  clockSeqEnabled = true;
+  updateClock();
+});
+
+// Fully kill sequence audio instantly when Stop is pressed
+document.getElementById('stopSeqBtn').addEventListener('click', () => {
+  clockSeqEnabled = false;
   
-  if (isMetroPlaying) {
-    currentBeat = 0;
-    nextBeatTime = audioCtx.currentTime + 0.05; 
-    metroInterval = setInterval(metroScheduler, 25);
-  } else {
-    clearInterval(metroInterval);
+  if (activeSeqVoice) {
+    const now = audioCtx.currentTime;
+    const vGain = activeSeqVoice.gain.gain;
+    vGain.setValueAtTime(vGain.value, now);
+    vGain.linearRampToValueAtTime(0.001, now + 0.03);
+    const src = activeSeqVoice.src;
+    setTimeout(() => { try { src.stop(); } catch(e){} }, 40);
+    activeSeqVoice = null;
   }
+  
+  updateClock();
 });
 
 // ── Computer keyboard ──────────────────────────────────────────────────────────
