@@ -33,10 +33,11 @@
   &nbsp;&nbsp;
   <label>Start key (MIDI): <input type="number" id="startKey" value="36" min="0" max="127"> (36 = C2)</label>
   &nbsp;&nbsp;
-  <button id="resliceBtn">Re-slice</button><br><br>
+  <button id="resliceBtn">Auto Re-slice</button>
+  <button id="clearSlicesBtn">Clear Slices (Start Fresh)</button><br><br>
   <label>Slices: <span id="sliceCount">—</span></label><br><br>
   <canvas id="waveform" width="700" height="80" style="border:1px solid #ccc; display:block; margin-bottom:6px;"></canvas>
-  <p style="font-size:12px; color:#666;">Each coloured band = one slice mapped to a key.</p><br>
+  <p style="font-size:12px; color:#666;">Each coloured band = one slice. <b>Hover & drag lines</b> to adjust. <b>Double-click</b> inside a slice to split it.</p><br>
 </div>
 
 <label>Volume: <input type="range" id="volume" min="0" max="2" step="0.01" value="1"></label><br><br>
@@ -158,6 +159,14 @@ document.getElementById('resliceBtn').addEventListener('click', buildSlices);
 document.getElementById('sliceInterval').addEventListener('change', buildSlices);
 document.getElementById('startKey').addEventListener('change', drawWaveform);
 
+document.getElementById('clearSlicesBtn').addEventListener('click', () => {
+  if (!sampleBuffer) return;
+  // Reset to a single slice encompassing the entire sample
+  slices = [{ start: 0, end: sampleBuffer.duration }];
+  document.getElementById('sliceCount').textContent = slices.length;
+  drawWaveform();
+});
+
 // ── Waveform + slice overlay ───────────────────────────────────────────────────
 const COLORS = ['#e74c3c','#e67e22','#f1c40f','#27ae60','#16a085','#2980b9','#8e44ad','#c0392b'];
 
@@ -214,6 +223,90 @@ function drawWaveform(highlightSlice = -1) {
   ctx.stroke();
 }
 
+// ── Interactive Slice Dragging & Splitting ─────────────────────────────────────
+const canvasEl = document.getElementById('waveform');
+let draggedMarker = -1; 
+
+canvasEl.addEventListener('mousedown', e => {
+  if (!sampleBuffer || slices.length < 2) return;
+  const rect = canvasEl.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const W = canvasEl.width;
+  const dur = sampleBuffer.duration;
+
+  // Check if we clicked near any slice boundary (except the very first and last)
+  for (let i = 1; i < slices.length; i++) {
+    const markerX = (slices[i].start / dur) * W;
+    if (Math.abs(x - markerX) < 6) { 
+      draggedMarker = i;
+      return;
+    }
+  }
+});
+
+canvasEl.addEventListener('mousemove', e => {
+  if (!sampleBuffer) return;
+  const rect = canvasEl.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const W = canvasEl.width;
+  const dur = sampleBuffer.duration;
+
+  // Handle Dragging
+  if (draggedMarker !== -1) {
+    let t = (x / W) * dur;
+    
+    // Constrain the drag so it can't cross the previous or next slice markers
+    const minT = slices[draggedMarker - 1].start + 0.01; 
+    const maxT = slices[draggedMarker].end - 0.01;
+    t = Math.max(minT, Math.min(t, maxT));
+    
+    // Update the boundary
+    slices[draggedMarker].start = t;
+    slices[draggedMarker - 1].end = t;
+    
+    drawWaveform();
+    return;
+  }
+
+  // Handle Hover state 
+  let hover = false;
+  for (let i = 1; i < slices.length; i++) {
+    const markerX = (slices[i].start / dur) * W;
+    if (Math.abs(x - markerX) < 6) {
+      hover = true;
+      break;
+    }
+  }
+  canvasEl.style.cursor = hover ? 'col-resize' : 'default';
+});
+
+canvasEl.addEventListener('mouseup', () => draggedMarker = -1);
+canvasEl.addEventListener('mouseleave', () => draggedMarker = -1);
+
+// Add New Slice on Double-Click
+canvasEl.addEventListener('dblclick', e => {
+  if (!sampleBuffer) return;
+  const rect = canvasEl.getBoundingClientRect();
+  const x = e.clientX - rect.left;
+  const W = canvasEl.width;
+  const t = (x / W) * sampleBuffer.duration;
+
+  // Find which slice we clicked inside and split it
+  for (let i = 0; i < slices.length; i++) {
+    if (t > slices[i].start && t < slices[i].end) {
+      const oldEnd = slices[i].end;
+      slices[i].end = t;
+      // Insert the new slice right after the current one
+      slices.splice(i + 1, 0, { start: t, end: oldEnd });
+      
+      document.getElementById('sliceCount').textContent = slices.length;
+      drawWaveform();
+      break;
+    }
+  }
+});
+
+// ── Playback ───────────────────────────────────────────────────────────────────
 function playNote(midi) {
   if (!sampleBuffer) return;
   
@@ -231,7 +324,6 @@ function playNote(midi) {
   const src = audioCtx.createBufferSource();
   const voiceGain = audioCtx.createGain(); 
 
-  // Use the reversed buffer if checked, otherwise original
   if (isReverse && reversedSampleBuffer) {
     src.buffer = reversedSampleBuffer;
   } else {
@@ -261,7 +353,6 @@ function playNote(midi) {
     document.getElementById('activeNote').textContent =
       `Playing: ${noteToName(midi)} (MIDI ${midi}) ${isReverse ? '[REV]' : ''}`;
   } else {
-    // --- SLICE MODE ---
     const startKey = parseInt(document.getElementById('startKey').value);
     const idx = midi - startKey;
     if (idx < 0 || idx >= slices.length) return;
@@ -269,7 +360,6 @@ function playNote(midi) {
     const sl = slices[idx];
     const playThrough = document.getElementById('playThrough').checked;
     
-    // Calculate start/end based on whether we are moving forward or backward
     let slStart = sl.start;
     let slEnd = sl.end;
     
@@ -278,17 +368,13 @@ function playNote(midi) {
       slEnd = sampleBuffer.duration - sl.start;
     }
     
-    // Check looping and play through states
     if (src.loop && !playThrough) {
-      // Loop just the specific slice
       src.loopStart = slStart;
       src.loopEnd = slEnd;
       src.start(0, slStart); 
     } else if (playThrough) {
-      // Play Through Mode: Start at the slice, let it ride to the end of the buffer
       src.start(0, slStart);
     } else {
-      // Standard Mode: Play exact duration of the slice and stop
       src.start(0, slStart, slEnd - slStart);
     }
 
@@ -305,29 +391,22 @@ function stopNote(midi) {
 
   const voice = active[midi];
   
-  // Prevent multiple stop calls from overlapping on the same voice
   if (voice.isStopping) return;
   voice.isStopping = true;
 
-  // 30ms fade out
   const fadeOutTime = 0.03; 
   const now = audioCtx.currentTime;
 
-  // Smoothly fade volume to 0
   voice.gain.gain.setValueAtTime(voice.gain.gain.value, now);
   voice.gain.gain.linearRampToValueAtTime(0.001, now + fadeOutTime);
 
-  // Stop the audio slightly AFTER the fade finishes
   setTimeout(() => {
     try { voice.src.stop(); } catch {}
     voice.gain.disconnect(); 
     
-    // THE FIX: Only delete this note from the active list if it hasn't 
-    // already been overwritten by a brand new key press!
     if (active[midi] === voice) {
       delete active[midi];
 
-      // Only clear the UI text if no other notes are currently playing
       if (Object.keys(active).length === 0) {
         document.getElementById('activeNote').textContent = '';
         if (document.getElementById('mode').value === 'slice') drawWaveform();
@@ -356,7 +435,7 @@ function nextBeat() {
   const bpm = parseInt(document.getElementById('metroBPM').value) || 120;
   const secondsPerBeat = 60.0 / bpm;
   nextBeatTime += secondsPerBeat;
-  currentBeat = (currentBeat + 1) % 4; // 4/4 time signature
+  currentBeat = (currentBeat + 1) % 4; 
 }
 
 function scheduleBeat(beatNumber, time) {
@@ -366,10 +445,8 @@ function scheduleBeat(beatNumber, time) {
   osc.connect(oscGain);
   oscGain.connect(masterGain);
   
-  // High pitched "tick" on the downbeat (beat 0), lower pitch on other beats
   osc.frequency.value = (beatNumber === 0) ? 880 : 440; 
   
-  // Short 50ms beep with a quick fade out to avoid clicks
   osc.start(time);
   osc.stop(time + 0.05);
   
@@ -378,7 +455,6 @@ function scheduleBeat(beatNumber, time) {
 }
 
 function metroScheduler() {
-  // Schedule any beats that need to play in the next 100ms
   while (nextBeatTime < audioCtx.currentTime + 0.1) {
     scheduleBeat(currentBeat, nextBeatTime);
     nextBeat();
@@ -391,7 +467,7 @@ document.getElementById('metroToggle').addEventListener('change', e => {
   
   if (isMetroPlaying) {
     currentBeat = 0;
-    nextBeatTime = audioCtx.currentTime + 0.05; // Start just slightly in the future
+    nextBeatTime = audioCtx.currentTime + 0.05; 
     metroInterval = setInterval(metroScheduler, 25);
   } else {
     clearInterval(metroInterval);
